@@ -7,22 +7,29 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONPATH=/app
 
 # ffmpeg = audio encoding/m4b assembly; espeak-ng = Kokoro G2P fallback /
-# non-English phonemization; libsndfile1 = soundfile backend.
-#
-# Intel GPU userspace (Level Zero compute runtime) comes from Intel's own apt
-# repo, not Debian's — Debian's bundled compute-runtime lags new Arc silicon
-# (Battlemage). Verify the repo path/key below against
-# https://dgpu-docs.intel.com/driver/client/overview.html before first build;
-# Intel rotates these periodically and this hasn't been build-tested on box.
+# non-English phonemization; libsndfile1 = soundfile backend. libze1 (Level
+# Zero loader) ships in Debian's own repo.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg espeak-ng libsndfile1 git curl ca-certificates gnupg wget \
-    && wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
-        | gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/debian bookworm client" \
-        > /etc/apt/sources.list.d/intel-gpu.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        intel-opencl-icd intel-level-zero-gpu level-zero \
+        ffmpeg espeak-ng libsndfile1 git curl ca-certificates libze1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Intel GPU compute userspace (compute-runtime + IGC) — Intel's apt repo
+# (repositories.intel.com/gpu) currently 403s (confirmed 2026-07-01), so pull
+# pinned .deb packages straight from the GitHub releases instead, which is
+# what Intel's own docs fall back to when the repo is down. Bump these tags
+# for newer Battlemage/Xe2 fixes: github.com/intel/compute-runtime/releases
+# and github.com/intel/intel-graphics-compiler/releases.
+RUN set -eux; \
+    tmp="$(mktemp -d)"; cd "$tmp"; \
+    CR_TAG=26.22.38646.4; \
+    IGC_TAG=v2.36.3; IGC_VER=2.36.3+21719; \
+    curl -fLO "https://github.com/intel/compute-runtime/releases/download/${CR_TAG}/intel-opencl-icd_${CR_TAG}-0_amd64.deb"; \
+    curl -fLO "https://github.com/intel/compute-runtime/releases/download/${CR_TAG}/libze-intel-gpu1_${CR_TAG}-0_amd64.deb"; \
+    curl -fLO "https://github.com/intel/compute-runtime/releases/download/${CR_TAG}/libigdgmm12_22.10.0_amd64.deb"; \
+    curl -fLO "https://github.com/intel/intel-graphics-compiler/releases/download/${IGC_TAG}/intel-igc-core-2_${IGC_VER}_amd64.deb"; \
+    curl -fLO "https://github.com/intel/intel-graphics-compiler/releases/download/${IGC_TAG}/intel-igc-opencl-2_${IGC_VER}_amd64.deb"; \
+    apt-get update && apt-get install -y --no-install-recommends ./*.deb; \
+    cd / && rm -rf "$tmp" /var/lib/apt/lists/*
 
 WORKDIR /app
 
