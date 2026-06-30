@@ -4,14 +4,20 @@ and on-demand voice sample generation.
 Two interchangeable backends live behind the same Engine API, picked by
 whichever package the image installed (only one is ever present):
   - `kokoro` (PyTorch) -- the Nvidia/CPU build (Dockerfile)
-  - `kokoro_onnx` (ONNX Runtime + OpenVINO GPU plugin) -- the Intel Arc build
-    (Dockerfile.arc). PyTorch's native XPU backend segfaults the B580's
-    blitter engine on this box (confirmed 2026-07-01); OpenVINO is the GPU
-    access path already proven stable here (Immich's ML container)."""
+  - native OpenVINO IR -- the Intel Arc build (Dockerfile.arc), using a
+    pre-converted Kokoro-82M IR model (Echo9Zulu/Kokoro-82M-FP16-OpenVINO, as
+    used by the OpenArc project). Two other approaches were tried and
+    rejected first (confirmed 2026-07-01): PyTorch's native XPU backend
+    segfaults the B580's blitter engine on every inference, and ONNX
+    Runtime's OpenVINOExecutionProvider rejects this model's ONNX export
+    outright (Interpolate/STFT op support gaps in the GPU plugin). The
+    native OpenVINO IR path actually runs, but needs
+    INFERENCE_PRECISION_HINT=f32 on GPU -- without it, output is all-NaN
+    (FP16 GPU compute overflows somewhere in this graph). Verified by ear:
+    GPU output sounds correct, matches CPU in RMS energy."""
 import os
 import re
 import threading
-import urllib.request
 import numpy as np
 import soundfile as sf
 
@@ -19,34 +25,28 @@ import voices as voicecat
 
 SAMPLE_RATE = 24000
 SAMPLES_DIR = "/data/samples"
-ONNX_CACHE_DIR = "/data/onnx-cache"
+OV_CACHE_DIR = "/data/ov-cache"
 
 try:
-    from kokoro_onnx import Kokoro as _KokoroONNX
-    _BACKEND = "onnx"
+    import openvino as ov
+    _BACKEND = "openvino"
 except ImportError:
     _BACKEND = "torch"
 
-# kokoro-onnx's `lang` expects espeak-style locale codes; Kokoro's voice-id
-# prefix scheme (voicecat.lang_code) uses single letters. Only languages
-# actually in the voice catalog are mapped.
-_ONNX_LANG = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr",
-              "h": "hi", "i": "it", "p": "pt-br"}
-
-_ONNX_MODEL_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/"
-                    "download/model-files-v1.0/kokoro-v1.0.fp16-gpu.onnx")
-_ONNX_VOICES_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/"
-                     "download/model-files-v1.0/voices-v1.0.bin")
+_OV_REPO = "Echo9Zulu/Kokoro-82M-FP16-OpenVINO"
+_VOCAB_REPO = "hexgrad/Kokoro-82M"
 
 
 class Engine:
     def __init__(self):
-        self._pipelines = {}
+        self._pipelines = {}        # torch backend: KPipeline per lang_code
+        self._quiet_pipelines = {}  # openvino backend: tokenize-only KPipeline per lang_code
+        self._voice_cache = {}      # openvino backend: voice pack tensors
         self._lock = threading.Lock()
         self.device = "cpu"
         os.makedirs(SAMPLES_DIR, exist_ok=True)
-        if _BACKEND == "onnx":
-            self._init_onnx()
+        if _BACKEND == "openvino":
+            self._init_openvino()
         else:
             try:
                 import torch
@@ -54,41 +54,55 @@ class Engine:
             except Exception:
                 pass
 
-    @staticmethod
-    def _fetch(url, dest):
-        if os.path.exists(dest) and os.path.getsize(dest) > 0:
-            return
-        tmp = dest + ".part"
-        print(f"[tts] downloading {url} -> {dest}", flush=True)
-        urllib.request.urlretrieve(url, tmp)
-        os.rename(tmp, dest)
+    def _init_openvino(self):
+        """Download the pre-converted IR model + vocab once (cached on the
+        /data volume) and compile it for GPU, falling back to CPU if the GPU
+        plugin fails to initialize or produces non-finite output."""
+        import json
+        from huggingface_hub import hf_hub_download
+        os.makedirs(OV_CACHE_DIR, exist_ok=True)
+        xml_path = hf_hub_download(_OV_REPO, "openvino_model.xml", cache_dir=OV_CACHE_DIR)
+        hf_hub_download(_OV_REPO, "openvino_model.bin", cache_dir=OV_CACHE_DIR)
+        cfg_path = hf_hub_download(_VOCAB_REPO, "config.json", cache_dir=OV_CACHE_DIR)
+        self._vocab = json.load(open(cfg_path))["vocab"]
 
-    def _init_onnx(self):
-        """Fetch the ONNX weights once (cached on the /data volume) and build
-        an onnxruntime session pinned to the OpenVINO GPU execution provider,
-        falling back to CPU if the GPU plugin fails to initialize."""
-        import onnxruntime as rt
-        os.makedirs(ONNX_CACHE_DIR, exist_ok=True)
-        model_path = os.path.join(ONNX_CACHE_DIR, "kokoro-v1.0.fp16-gpu.onnx")
-        voices_path = os.path.join(ONNX_CACHE_DIR, "voices-v1.0.bin")
-        self._fetch(_ONNX_MODEL_URL, model_path)
-        self._fetch(_ONNX_VOICES_URL, voices_path)
+        core = ov.Core()
+        model = core.read_model(xml_path)
         try:
-            session = rt.InferenceSession(
-                model_path,
-                providers=["OpenVINOExecutionProvider", "CPUExecutionProvider"],
-                provider_options=[{"device_type": "GPU"}, {}],
-            )
-            if session.get_providers()[0] == "OpenVINOExecutionProvider":
-                self.device = "openvino"
-        except Exception as e:  # noqa: BLE001 — fall back to CPU EP
-            print(f"[tts] OpenVINO GPU session failed, falling back to CPU: {e}", flush=True)
-            session = rt.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-        self._kokoro = _KokoroONNX.from_session(session, voices_path)
+            compiled = core.compile_model(model, "GPU", {"INFERENCE_PRECISION_HINT": "f32"})
+            warmup = compiled([np.array([[0, 1, 0]], dtype=np.int64),
+                                np.zeros((1, 256), dtype=np.float32),
+                                np.array(1.0, dtype=np.float32)])[0]
+            if not np.isfinite(warmup).all():
+                raise RuntimeError("GPU produced non-finite output on warmup")
+            self._compiled = compiled
+            self.device = "openvino"
+        except Exception as e:  # noqa: BLE001 — fall back to CPU
+            print(f"[tts] OpenVINO GPU compile/warmup failed, falling back to CPU: {e}", flush=True)
+            self._compiled = core.compile_model(model, "CPU")
+
+    def _quiet_pipeline(self, lang_code: str):
+        """OpenVINO backend only -- G2P/tokenization without a PyTorch model
+        attached (kokoro's KPipeline(model=False) skips building KModel)."""
+        with self._lock:
+            if lang_code not in self._quiet_pipelines:
+                from kokoro import KPipeline
+                self._quiet_pipelines[lang_code] = KPipeline(lang_code=lang_code, model=False)
+            return self._quiet_pipelines[lang_code]
+
+    def _voice_pack(self, voice: str):
+        """OpenVINO backend only -- per-voice style vectors, shape [510,1,256]
+        (max-510-phoneme buckets), downloaded once and cached on /data."""
+        with self._lock:
+            if voice not in self._voice_cache:
+                import torch
+                from huggingface_hub import hf_hub_download
+                path = hf_hub_download(_OV_REPO, f"voices/{voice}.pt", cache_dir=OV_CACHE_DIR)
+                self._voice_cache[voice] = torch.load(path, weights_only=True).numpy()
+            return self._voice_cache[voice]
 
     def pipeline(self, lang_code: str):
-        """PyTorch backend only — kokoro-onnx uses a single session, no
-        per-language pipeline cache."""
+        """PyTorch backend only."""
         with self._lock:
             if lang_code not in self._pipelines:
                 from kokoro import KPipeline
@@ -98,10 +112,11 @@ class Engine:
     def unload(self):
         """Drop cached pipelines and release GPU memory, so another model
         (Ollama, for Smart cast) can claim the VRAM. Pipelines reload lazily
-        on the next synth. No-op on the OpenVINO backend: an 82M-param FP16
-        session is small, and Smart cast there talks to an externally-managed
-        Ollama instance with its own GPU memory lifecycle, not this process."""
-        if _BACKEND == "onnx":
+        on the next synth. No-op on the OpenVINO backend: the compiled model
+        stays resident permanently, and Smart cast there talks to an
+        externally-managed Ollama instance with its own GPU memory
+        lifecycle, not this process."""
+        if _BACKEND == "openvino":
             return
         with self._lock:
             self._pipelines.clear()
@@ -165,10 +180,20 @@ class Engine:
     def synth_chunk(self, text: str, voice: str, speed: float = 1.0) -> np.ndarray:
         """Synthesize one chunk, returning a float32 mono waveform at 24kHz."""
         text = self.clean_speech_text(text)
-        if _BACKEND == "onnx":
-            lang = _ONNX_LANG.get(voicecat.lang_code(voice), "en-us")
-            samples, _sr = self._kokoro.create(text, voice=voice, speed=speed, lang=lang)
-            return np.asarray(samples, dtype="float32")
+        if _BACKEND == "openvino":
+            pipe = self._quiet_pipeline(voicecat.lang_code(voice))
+            ps = None
+            for _, phonemes, _ in pipe(text, voice=voice, speed=speed):
+                ps = phonemes
+                break
+            if not ps:
+                return np.zeros(0, dtype="float32")
+            ids = [i for i in (self._vocab.get(p) for p in ps) if i is not None]
+            input_ids = np.array([[0, *ids, 0]], dtype=np.int64)
+            ref_s = self._voice_pack(voice)[len(ps) - 1].astype(np.float32)
+            speed_arr = np.array(speed, dtype=np.float32)
+            audio = self._compiled([input_ids, ref_s, speed_arr])[0]
+            return np.asarray(audio, dtype="float32")
         pipe = self.pipeline(voicecat.lang_code(voice))
         audio_parts = []
         for _, _, audio in pipe(text, voice=voice, speed=speed):

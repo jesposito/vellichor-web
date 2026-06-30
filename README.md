@@ -99,29 +99,50 @@ To try a more accurate (heavier) model, pull it and set `SMARTCAST_MODEL` in
 
 ## Intel Arc build (OpenVINO)
 This fork adds a second build path for Intel Arc GPUs (Alchemist/Battlemage,
-e.g. the A380/B580). It uses `kokoro-onnx` (ONNX Runtime + the OpenVINO GPU
-execution provider) instead of the official PyTorch-based `kokoro` package.
+e.g. the A380/B580). It runs a pre-converted OpenVINO IR build of Kokoro-82M
+(`Echo9Zulu/Kokoro-82M-FP16-OpenVINO`, the same model the actively-maintained
+[OpenArc](https://github.com/SearchSavior/OpenArc) project uses) through the
+native `openvino` Python package. `kokoro` + `misaki` (CPU-only PyTorch
+build) are still installed, but only for their tokenizer/G2P — actual audio
+synthesis runs through the OpenVINO model, not PyTorch.
 
-**Why OpenVINO and not PyTorch's native XPU backend:** we tried the XPU
-backend first — `torch.xpu.is_available()` detects the GPU fine, but the
-moment Kokoro actually runs inference on it, it segfaults and resets the
-GPU's blitter engine (`xe ...: Engine reset: engine_class=bcs`), every time,
-confirmed on a real B580. OpenVINO is the GPU access path already proven
-stable on Arc elsewhere (e.g. Immich's `-openvino` ML container) — same
-underlying compute-runtime/Level-Zero driver, different (more mature) software
-stack on top of it.
+**Why this specific path** — two other approaches were tried and rejected
+first, confirmed on a real B580 (2026-07-01):
+- **PyTorch's native XPU backend**: `torch.xpu.is_available()` detects the
+  GPU fine, but the moment Kokoro actually runs inference on it, it
+  segfaults and resets the GPU's blitter engine
+  (`xe ...: Engine reset: engine_class=bcs`), every time.
+- **ONNX Runtime + OpenVINOExecutionProvider**, using `kokoro-onnx`'s
+  published ONNX exports: rejected outright at graph-compile time — an
+  `Interpolate` op with an unsupported tensor rank, and (with `HETERO`/`AUTO`
+  partial-offload) a dynamic-rank `STFT` node neither the GPU nor CPU
+  OpenVINO plugin would accept. A *third* independent attempt at converting
+  Kokoro for OpenVINO (`Echo9Zulu/Kokoro-82M-FP16-OpenVINO`'s own model card)
+  documents yet another distinct unsupported op (`ScatterNDUpdate`/INT64) and
+  ships as CPU-only for that reason.
+- **What actually worked**: the same `Echo9Zulu/Kokoro-82M-FP16-OpenVINO` IR
+  model *does* compile and run on GPU via the native `openvino` package
+  (not `onnxruntime`) — but raw GPU output was 100% NaN until setting
+  `INFERENCE_PRECISION_HINT: f32` on `core.compile_model(...)` (forces FP32
+  compute even though the IR is stored FP16 — a known fix for this failure
+  class). After a one-time ~5s JIT warmup (paid once at startup), GPU
+  inference is ~20-25% faster than CPU for the same input, and a real
+  CPU-vs-GPU audio comparison confirmed by ear that GPU output is correct
+  (not garbled) — RMS energy was within ~4% of the CPU reference despite a
+  large sample-level numerical divergence (expected: LSTM-based duration
+  predictor, floating-point execution-order differences compound over many
+  timesteps without affecting perceptual quality).
 
 ```bash
 docker compose -f docker-compose.arc.yml up -d --build
 ```
 
-- Uses `Dockerfile.arc` — no PyTorch/CUDA at all, just `onnxruntime-openvino`
-  + `kokoro-onnx`. Lighter image than the CUDA build (~1GB+ smaller, no torch
-  wheel).
+- Uses `Dockerfile.arc` — no PyTorch CUDA/XPU wheel; just the CPU PyTorch
+  wheel (tokenizer only) + native `openvino`.
 - Passes `/dev/dri` through instead of `runtime: nvidia` — no Nvidia Driver
   plugin needed, just the host having Arc's kernel driver (i915/xe) loaded.
-- Downloads `kokoro-v1.0.fp16-gpu.onnx` + `voices-v1.0.bin` on first run,
-  cached under `./data/onnx-cache/`.
+- Downloads the OpenVINO IR model + vocab + per-voice style vectors on first
+  use, cached under `./data/ov-cache/`.
 - Smart cast points at an **external** Ollama-compatible endpoint
   (`OLLAMA_URL`, default `http://ipex-ollama:11434`) reachable on the
   `ansiblenet`-style network you configure — there's no bundled Ollama
@@ -129,10 +150,9 @@ docker compose -f docker-compose.arc.yml up -d --build
   backend, so use a real GPU-backed endpoint (e.g. `intelanalytics/ipex-llm`)
   if you want Smart cast to actually use the GPU; otherwise point it at any
   CPU-only Ollama.
-- The `⚡ GPU` chip in the header reads `OPENVINO` when the GPU execution
-  provider initializes successfully; it silently falls back to CPU
-  (`device: cpu`) if the OpenVINO GPU plugin fails to load, rather than
-  crashing.
+- The `⚡ GPU` chip in the header reads `OPENVINO` when the GPU compiles and
+  passes a finite-output warmup check; it falls back to CPU (`device: cpu`)
+  cleanly if either fails, rather than crashing.
 - The Intel driver `.deb` pins in `Dockerfile.arc` are the same versions
   used by Immich's official `-openvino` image — proven stable on a real B580
   as of 2026-07-01, but check

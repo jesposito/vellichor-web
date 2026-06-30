@@ -34,15 +34,24 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# Kokoro via ONNX Runtime + the OpenVINO execution provider (GPU plugin) --
-# NOT PyTorch's native XPU backend, which segfaults the B580's blitter
-# engine on this box (confirmed 2026-07-01, see git history). OpenVINO is
-# the same GPU access path already proven stable here (Immich's ML
-# container). onnxruntime-openvino bundles its own onnxruntime build, so
-# kokoro-onnx's own onnxruntime dependency is skipped (--no-deps) to avoid
-# pip installing a second, conflicting onnxruntime package.
-RUN pip install onnxruntime-openvino espeakng-loader "phonemizer-fork>=3.3.2" \
-    && pip install --no-deps kokoro-onnx
+# Kokoro via a pre-converted OpenVINO IR model (Echo9Zulu/Kokoro-82M-FP16-
+# OpenVINO, the same one the actively-maintained OpenArc project uses) run
+# through the native `openvino` package -- NOT PyTorch's native XPU backend
+# (segfaults the B580's blitter engine on every inference, confirmed
+# 2026-07-01) and NOT ONNX Runtime's OpenVINOExecutionProvider (rejects this
+# model's ONNX export outright: Interpolate/STFT op support gaps in the GPU
+# plugin, also confirmed 2026-07-01). The native IR path actually works, but
+# needs INFERENCE_PRECISION_HINT=f32 set at runtime (see app/tts.py) --
+# without it, GPU output is all-NaN.
+#
+# `kokoro` (PyTorch, CPU-only wheel) + misaki are kept ONLY for their
+# tokenizer/G2P (KPipeline(model=False) skips building the actual model) --
+# actual audio synthesis runs through the OpenVINO IR model, not PyTorch.
+# en_core_web_sm is misaki's English G2P model; installing it at build time
+# avoids it auto-downloading over the network on first request.
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install "kokoro>=0.9.4" "misaki[en]>=0.9.4" openvino huggingface_hub \
+    && pip install "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
 
 COPY requirements-arc.txt requirements.txt
 RUN pip install -r requirements.txt
