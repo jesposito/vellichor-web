@@ -6,8 +6,8 @@ services:
   vellichor-web:
     build:
       context: .
-      dockerfile: Dockerfile.xpu
-    image: vellichor-web:xpu
+      dockerfile: Dockerfile.arc
+    image: vellichor-web:arc
     container_name: vellichor-web
     restart: unless-stopped
     devices:

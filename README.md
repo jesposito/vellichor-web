@@ -10,7 +10,7 @@ back to CPU. Built for writing & converting stories. Open source (MIT).
 - **(Optional) NVIDIA GPU** for acceleration — requires the NVIDIA Container
   Toolkit on the host (on Unraid, the **Nvidia Driver** plugin). **(Optional)
   Intel Arc GPU** (Alchemist/Battlemage) is also supported via a separate
-  build — see *Intel Arc (XPU) build* below. With no GPU it runs on CPU
+  build — see *Intel Arc build (OpenVINO)* below. With no GPU it runs on CPU
   instead — see the no-GPU note in *Getting started*.
 - ~6 GB of disk for the image plus models (Kokoro + the Ollama LLM, downloaded
   on first use).
@@ -97,30 +97,47 @@ after use so Kokoro has room (on an 8 GB card they can't both stay resident).
 To try a more accurate (heavier) model, pull it and set `SMARTCAST_MODEL` in
 `.env` (e.g. `qwen2.5:7b`), then `up -d`.
 
-## Intel Arc (XPU) build
+## Intel Arc build (OpenVINO)
 This fork adds a second build path for Intel Arc GPUs (Alchemist/Battlemage,
-e.g. the A380/B580) using PyTorch's native XPU backend instead of CUDA.
+e.g. the A380/B580). It uses `kokoro-onnx` (ONNX Runtime + the OpenVINO GPU
+execution provider) instead of the official PyTorch-based `kokoro` package.
+
+**Why OpenVINO and not PyTorch's native XPU backend:** we tried the XPU
+backend first — `torch.xpu.is_available()` detects the GPU fine, but the
+moment Kokoro actually runs inference on it, it segfaults and resets the
+GPU's blitter engine (`xe ...: Engine reset: engine_class=bcs`), every time,
+confirmed on a real B580. OpenVINO is the GPU access path already proven
+stable on Arc elsewhere (e.g. Immich's `-openvino` ML container) — same
+underlying compute-runtime/Level-Zero driver, different (more mature) software
+stack on top of it.
 
 ```bash
-docker compose -f docker-compose.xpu.yml up -d --build
+docker compose -f docker-compose.arc.yml up -d --build
 ```
 
-- Uses `Dockerfile.xpu` (PyTorch XPU wheel + Intel's Level Zero compute
-  runtime) instead of the CUDA `Dockerfile`.
+- Uses `Dockerfile.arc` — no PyTorch/CUDA at all, just `onnxruntime-openvino`
+  + `kokoro-onnx`. Lighter image than the CUDA build (~1GB+ smaller, no torch
+  wheel).
 - Passes `/dev/dri` through instead of `runtime: nvidia` — no Nvidia Driver
   plugin needed, just the host having Arc's kernel driver (i915/xe) loaded.
-- Smart cast's bundled `ollama` service runs **CPU-only** in this build —
-  Ollama has no mainline Intel Arc backend. `llama3.2:3b` on CPU is workable
-  for occasional use; for GPU-backed Smart cast, point `OLLAMA_URL` at an
-  external GPU-backed Ollama/ipex-llm endpoint instead and drop the bundled
-  `ollama` service from `docker-compose.xpu.yml`.
-- The `⚡ GPU` chip in the header reads `XPU` when this build is active and
-  the device is detected.
-- Untested on real Arc hardware as of this writing — the Intel apt repo
-  pinned in `Dockerfile.xpu` is the most likely thing to need adjusting
-  (Intel rotates repo paths/keys); if `torch.xpu.is_available()` comes back
-  false, check `docker compose -f docker-compose.xpu.yml logs` for the driver
-  install step and check https://dgpu-docs.intel.com for current package names.
+- Downloads `kokoro-v1.0.fp16-gpu.onnx` + `voices-v1.0.bin` on first run,
+  cached under `./data/onnx-cache/`.
+- Smart cast points at an **external** Ollama-compatible endpoint
+  (`OLLAMA_URL`, default `http://ipex-ollama:11434`) reachable on the
+  `ansiblenet`-style network you configure — there's no bundled Ollama
+  service in this compose file. Ollama itself has no mainline Intel Arc
+  backend, so use a real GPU-backed endpoint (e.g. `intelanalytics/ipex-llm`)
+  if you want Smart cast to actually use the GPU; otherwise point it at any
+  CPU-only Ollama.
+- The `⚡ GPU` chip in the header reads `OPENVINO` when the GPU execution
+  provider initializes successfully; it silently falls back to CPU
+  (`device: cpu`) if the OpenVINO GPU plugin fails to load, rather than
+  crashing.
+- The Intel driver `.deb` pins in `Dockerfile.arc` are the same versions
+  used by Immich's official `-openvino` image — proven stable on a real B580
+  as of 2026-07-01, but check
+  github.com/intel/compute-runtime/releases for newer Battlemage fixes if
+  you hit GPU issues.
 
 ## Configuration (`.env`)
 - `VELLICHOR_PASSWORD` — login password (change anytime, then `up -d`).

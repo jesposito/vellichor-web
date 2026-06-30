@@ -1,8 +1,17 @@
 """Kokoro TTS engine wrapper: pipeline caching, text chunking, synthesis,
-and on-demand voice sample generation."""
+and on-demand voice sample generation.
+
+Two interchangeable backends live behind the same Engine API, picked by
+whichever package the image installed (only one is ever present):
+  - `kokoro` (PyTorch) -- the Nvidia/CPU build (Dockerfile)
+  - `kokoro_onnx` (ONNX Runtime + OpenVINO GPU plugin) -- the Intel Arc build
+    (Dockerfile.arc). PyTorch's native XPU backend segfaults the B580's
+    blitter engine on this box (confirmed 2026-07-01); OpenVINO is the GPU
+    access path already proven stable here (Immich's ML container)."""
 import os
 import re
 import threading
+import urllib.request
 import numpy as np
 import soundfile as sf
 
@@ -10,6 +19,24 @@ import voices as voicecat
 
 SAMPLE_RATE = 24000
 SAMPLES_DIR = "/data/samples"
+ONNX_CACHE_DIR = "/data/onnx-cache"
+
+try:
+    from kokoro_onnx import Kokoro as _KokoroONNX
+    _BACKEND = "onnx"
+except ImportError:
+    _BACKEND = "torch"
+
+# kokoro-onnx's `lang` expects espeak-style locale codes; Kokoro's voice-id
+# prefix scheme (voicecat.lang_code) uses single letters. Only languages
+# actually in the voice catalog are mapped.
+_ONNX_LANG = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr",
+              "h": "hi", "i": "it", "p": "pt-br"}
+
+_ONNX_MODEL_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/"
+                    "download/model-files-v1.0/kokoro-v1.0.fp16-gpu.onnx")
+_ONNX_VOICES_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/"
+                     "download/model-files-v1.0/voices-v1.0.bin")
 
 
 class Engine:
@@ -17,34 +44,65 @@ class Engine:
         self._pipelines = {}
         self._lock = threading.Lock()
         self.device = "cpu"
-        try:
-            import torch
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif hasattr(torch, "xpu") and torch.xpu.is_available():
-                self.device = "xpu"  # Intel Arc/Battlemage, via the XPU torch build
-        except Exception:
-            pass
         os.makedirs(SAMPLES_DIR, exist_ok=True)
+        if _BACKEND == "onnx":
+            self._init_onnx()
+        else:
+            try:
+                import torch
+                self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                pass
+
+    @staticmethod
+    def _fetch(url, dest):
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return
+        tmp = dest + ".part"
+        print(f"[tts] downloading {url} -> {dest}", flush=True)
+        urllib.request.urlretrieve(url, tmp)
+        os.rename(tmp, dest)
+
+    def _init_onnx(self):
+        """Fetch the ONNX weights once (cached on the /data volume) and build
+        an onnxruntime session pinned to the OpenVINO GPU execution provider,
+        falling back to CPU if the GPU plugin fails to initialize."""
+        import onnxruntime as rt
+        os.makedirs(ONNX_CACHE_DIR, exist_ok=True)
+        model_path = os.path.join(ONNX_CACHE_DIR, "kokoro-v1.0.fp16-gpu.onnx")
+        voices_path = os.path.join(ONNX_CACHE_DIR, "voices-v1.0.bin")
+        self._fetch(_ONNX_MODEL_URL, model_path)
+        self._fetch(_ONNX_VOICES_URL, voices_path)
+        try:
+            session = rt.InferenceSession(
+                model_path,
+                providers=["OpenVINOExecutionProvider", "CPUExecutionProvider"],
+                provider_options=[{"device_type": "GPU"}, {}],
+            )
+            if session.get_providers()[0] == "OpenVINOExecutionProvider":
+                self.device = "openvino"
+        except Exception as e:  # noqa: BLE001 — fall back to CPU EP
+            print(f"[tts] OpenVINO GPU session failed, falling back to CPU: {e}", flush=True)
+            session = rt.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self._kokoro = _KokoroONNX.from_session(session, voices_path)
 
     def pipeline(self, lang_code: str):
+        """PyTorch backend only — kokoro-onnx uses a single session, no
+        per-language pipeline cache."""
         with self._lock:
             if lang_code not in self._pipelines:
                 from kokoro import KPipeline
-                if self.device == "xpu":
-                    # KPipeline's own device autodetect only knows cuda/mps/cpu, so
-                    # build the model ourselves and hand it in already-placed on XPU.
-                    from kokoro import KModel
-                    model = KModel().to("xpu").eval()
-                    self._pipelines[lang_code] = KPipeline(lang_code=lang_code, model=model)
-                else:
-                    self._pipelines[lang_code] = KPipeline(lang_code=lang_code)
+                self._pipelines[lang_code] = KPipeline(lang_code=lang_code)
             return self._pipelines[lang_code]
 
     def unload(self):
         """Drop cached pipelines and release GPU memory, so another model
         (Ollama, for Smart cast) can claim the VRAM. Pipelines reload lazily
-        on the next synth."""
+        on the next synth. No-op on the OpenVINO backend: an 82M-param FP16
+        session is small, and Smart cast there talks to an externally-managed
+        Ollama instance with its own GPU memory lifecycle, not this process."""
+        if _BACKEND == "onnx":
+            return
         with self._lock:
             self._pipelines.clear()
         try:
@@ -53,8 +111,6 @@ class Engine:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            elif hasattr(torch, "xpu") and torch.xpu.is_available():
-                torch.xpu.empty_cache()
         except Exception:  # noqa: BLE001
             pass
 
@@ -109,6 +165,10 @@ class Engine:
     def synth_chunk(self, text: str, voice: str, speed: float = 1.0) -> np.ndarray:
         """Synthesize one chunk, returning a float32 mono waveform at 24kHz."""
         text = self.clean_speech_text(text)
+        if _BACKEND == "onnx":
+            lang = _ONNX_LANG.get(voicecat.lang_code(voice), "en-us")
+            samples, _sr = self._kokoro.create(text, voice=voice, speed=speed, lang=lang)
+            return np.asarray(samples, dtype="float32")
         pipe = self.pipeline(voicecat.lang_code(voice))
         audio_parts = []
         for _, _, audio in pipe(text, voice=voice, speed=speed):
