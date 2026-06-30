@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -15,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # https://dgpu-docs.intel.com/driver/client/overview.html before first build;
 # Intel rotates these periodically and this hasn't been build-tested on box.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg espeak-ng libsndfile1 git curl ca-certificates gpg-agent wget \
+        ffmpeg espeak-ng libsndfile1 git curl ca-certificates gnupg wget \
     && wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
         | gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/debian bookworm client" \
