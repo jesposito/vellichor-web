@@ -19,7 +19,10 @@ class Engine:
         self.device = "cpu"
         try:
             import torch
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                self.device = "xpu"  # Intel Arc/Battlemage, via the XPU torch build
         except Exception:
             pass
         os.makedirs(SAMPLES_DIR, exist_ok=True)
@@ -28,7 +31,14 @@ class Engine:
         with self._lock:
             if lang_code not in self._pipelines:
                 from kokoro import KPipeline
-                self._pipelines[lang_code] = KPipeline(lang_code=lang_code)
+                if self.device == "xpu":
+                    # KPipeline's own device autodetect only knows cuda/mps/cpu, so
+                    # build the model ourselves and hand it in already-placed on XPU.
+                    from kokoro import KModel
+                    model = KModel().to("xpu").eval()
+                    self._pipelines[lang_code] = KPipeline(lang_code=lang_code, model=model)
+                else:
+                    self._pipelines[lang_code] = KPipeline(lang_code=lang_code)
             return self._pipelines[lang_code]
 
     def unload(self):
@@ -43,6 +53,8 @@ class Engine:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.empty_cache()
         except Exception:  # noqa: BLE001
             pass
 

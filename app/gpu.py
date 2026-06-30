@@ -1,11 +1,13 @@
 """Serialize the two GPU consumers — Kokoro TTS and the Ollama Smart-cast model
-— so they never fight over the GTX 1080's 8 GB of VRAM at the same time, and so
-the VRAM is handed cleanly from one to the other.
+— so they never fight over VRAM at the same time, and so it's handed cleanly
+from one to the other.
 
-The 1080 cannot hold both models at once: Kokoro sits resident on CUDA, leaving
-too little free VRAM for llama3.2:3b, which then silently falls back to running
-entirely on the CPU. Whichever consumer is about to run takes LOCK and evicts
-the other from VRAM first, so it gets a full GPU offload instead of CPU fallback.
+On a single card, both can't hold the GPU at once: whichever sits resident
+leaves too little free VRAM for the other, which then silently falls back to
+running entirely on the CPU. Whichever consumer is about to run takes LOCK and
+evicts the other from VRAM first, so it gets a full GPU offload instead of CPU
+fallback. (Note: on the Intel XPU build, Ollama itself isn't GPU-accelerated —
+see docker-compose.xpu.yml — so this mainly matters on the Nvidia build.)
 """
 import os
 import threading

@@ -8,8 +8,10 @@ back to CPU. Built for writing & converting stories. Open source (MIT).
 ## Requirements
 - **Docker** and **Docker Compose**.
 - **(Optional) NVIDIA GPU** for acceleration — requires the NVIDIA Container
-  Toolkit on the host (on Unraid, the **Nvidia Driver** plugin). With no GPU it
-  runs on CPU instead — see the no-GPU note in *Getting started*.
+  Toolkit on the host (on Unraid, the **Nvidia Driver** plugin). **(Optional)
+  Intel Arc GPU** (Alchemist/Battlemage) is also supported via a separate
+  build — see *Intel Arc (XPU) build* below. With no GPU it runs on CPU
+  instead — see the no-GPU note in *Getting started*.
 - ~6 GB of disk for the image plus models (Kokoro + the Ollama LLM, downloaded
   on first use).
 
@@ -94,6 +96,31 @@ Both models share the GPU; `OLLAMA_KEEP_ALIVE=2m` unloads the LLM from VRAM
 after use so Kokoro has room (on an 8 GB card they can't both stay resident).
 To try a more accurate (heavier) model, pull it and set `SMARTCAST_MODEL` in
 `.env` (e.g. `qwen2.5:7b`), then `up -d`.
+
+## Intel Arc (XPU) build
+This fork adds a second build path for Intel Arc GPUs (Alchemist/Battlemage,
+e.g. the A380/B580) using PyTorch's native XPU backend instead of CUDA.
+
+```bash
+docker compose -f docker-compose.xpu.yml up -d --build
+```
+
+- Uses `Dockerfile.xpu` (PyTorch XPU wheel + Intel's Level Zero compute
+  runtime) instead of the CUDA `Dockerfile`.
+- Passes `/dev/dri` through instead of `runtime: nvidia` — no Nvidia Driver
+  plugin needed, just the host having Arc's kernel driver (i915/xe) loaded.
+- Smart cast's bundled `ollama` service runs **CPU-only** in this build —
+  Ollama has no mainline Intel Arc backend. `llama3.2:3b` on CPU is workable
+  for occasional use; for GPU-backed Smart cast, point `OLLAMA_URL` at an
+  external GPU-backed Ollama/ipex-llm endpoint instead and drop the bundled
+  `ollama` service from `docker-compose.xpu.yml`.
+- The `⚡ GPU` chip in the header reads `XPU` when this build is active and
+  the device is detected.
+- Untested on real Arc hardware as of this writing — the Intel apt repo
+  pinned in `Dockerfile.xpu` is the most likely thing to need adjusting
+  (Intel rotates repo paths/keys); if `torch.xpu.is_available()` comes back
+  false, check `docker compose -f docker-compose.xpu.yml logs` for the driver
+  install step and check https://dgpu-docs.intel.com for current package names.
 
 ## Configuration (`.env`)
 - `VELLICHOR_PASSWORD` — login password (change anytime, then `up -d`).
