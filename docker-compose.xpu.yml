@@ -1,3 +1,7 @@
+# Assumes an existing GPU-backed Ollama-compatible endpoint is already running
+# on the `ansiblenet` external network (e.g. ipex-llm's Ollama-API server on
+# Intel Arc). If you don't have one, add back a bundled `ollama` service (see
+# git history) — it'll run CPU-only since Ollama has no mainline Arc backend.
 services:
   vellichor-web:
     build:
@@ -10,37 +14,28 @@ services:
       - /dev/dri:/dev/dri
     ports:
       - "7777:7777"
+    networks:
+      - ansiblenet
     environment:
       # Auth (set in .env)
       VELLICHOR_PASSWORD: "${VELLICHOR_PASSWORD}"
       SECRET_KEY: "${SECRET_KEY}"
       # Own exported audiobooks as the Audiobookshelf user so ABS can read them
-      ABS_UID: "911"
-      ABS_GID: "911"
+      # (match your ABS container's PUID/PGID — Unraid default is 99/100, not
+      # the linuxserver.io-convention 911/911)
+      ABS_UID: "${ABS_UID:-99}"
+      ABS_GID: "${ABS_GID:-100}"
       # Optional: push a notification when a conversion finishes
       # (e.g. ntfy at http://<server-ip>:8087/<topic>, gotify at :8070)
       NOTIFY_URL: "${NOTIFY_URL:-}"
-      # AI "Smart cast" — local Ollama model for speaker attribution. Ollama
-      # has no mainline Intel Arc backend, so this build runs it CPU-only
-      # (llama3.2:3b is small enough that this is tolerable for occasional
-      # use). Point OLLAMA_URL at an existing GPU-backed Ollama/ipex-llm
-      # endpoint instead if you have one, and drop the bundled `ollama`
-      # service below.
-      OLLAMA_URL: "http://ollama:11434"
-      SMARTCAST_MODEL: "${SMARTCAST_MODEL:-llama3.2:3b}"
+      # AI "Smart cast" — points at an existing GPU-backed Ollama-compatible
+      # server reachable by container name on ansiblenet.
+      OLLAMA_URL: "${OLLAMA_URL:-http://ipex-ollama:11434}"
+      SMARTCAST_MODEL: "${SMARTCAST_MODEL:-qwen2.5:7b-instruct-q4_K_M}"
     volumes:
       - ./data:/data
-      - /mnt/user/eMedia/eMedia/Audiobooks:/library
-    depends_on:
-      - ollama
+      - "${AUDIOBOOK_LIBRARY_PATH:-/mnt/user/Audiobooks}:/library"
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: vellichor-ollama
-    restart: unless-stopped
-    environment:
-      # Unload the model after use; keeps the CPU-only container's RAM down
-      # between Smart-cast requests.
-      OLLAMA_KEEP_ALIVE: "2m"
-    volumes:
-      - ./data/ollama:/root/.ollama
+networks:
+  ansiblenet:
+    external: true
